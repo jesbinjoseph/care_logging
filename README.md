@@ -38,6 +38,8 @@ signals so the stdout/stderr split is re-applied after that hijack.
 
 - CLI log levels (`-l INFO`, etc.) are preserved
 - Task loggers keep `propagate=False` and get their own split handlers (no duplicates)
+- Celery's `TaskFormatter` is preserved so `%(task_name)s` / `%(task_id)s` keep working
+- Loggers disabled by Care deployment's `disable_existing_loggers=True` are re-enabled
 - File logging (`--logfile`) is left alone
 - If Celery is not installed, the Django path still works; Celery hooks soft-import
 
@@ -52,7 +54,9 @@ signals so the stdout/stderr split is re-applied after that hijack.
 
 ## Enable
 
-Prefer a **tagged release** in production rather than `@main`.
+Prefer a **tagged release** in production rather than `@main`. Create and push a
+release tag before installing (for example `git tag v0.1.0 && git push --tags`),
+then pin that tag below. Do not use `@main` or a tag that does not exist yet.
 
 ### `ADDITIONAL_PLUGS`
 
@@ -76,7 +80,7 @@ from plugs.plug import Plug
 care_logging = Plug(
     name="care_logging",
     package_name="git+https://github.com/jesbinjoseph/care_logging.git",
-    version="@v0.1.0",
+    version="@v0.1.0",  # pin a published tag; create it before deploying
     configs={},
 )
 

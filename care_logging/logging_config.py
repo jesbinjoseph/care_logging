@@ -15,6 +15,7 @@ import logging
 import logging.config
 import sys
 import threading
+from collections.abc import Callable
 from typing import Any
 
 from django.conf import settings
@@ -24,10 +25,12 @@ logger = logging.getLogger(__name__)
 _apply_lock = threading.Lock()
 _celery_hooks_installed = False
 
-# Plug-specific dictConfig names — never overwrite Care's generic keys.
+# Preferred plug-specific dictConfig names — never overwrite Care's generic keys.
 FILTER_NAME = "care_logging_below_error"
 STDOUT_HANDLER_NAME = "care_logging_stdout"
 STDERR_HANDLER_NAME = "care_logging_stderr"
+
+_BELOW_ERROR_FILTER_FACTORY = "care_logging.logging_config.BelowErrorFilter"
 
 _STREAM_HANDLER_CLASSES = frozenset(
     {
@@ -37,6 +40,7 @@ _STREAM_HANDLER_CLASSES = frozenset(
 )
 
 _LOGGER_SPLIT_MARKER = "_care_logging_stream_split"
+_CELERY_LOGGER_PREFIXES = ("celery",)
 
 
 class BelowErrorFilter(logging.Filter):
@@ -70,12 +74,69 @@ def _ensure_formatter(config: dict[str, Any], name: str) -> None:
     }
 
 
-def _ensure_below_error_filter(config: dict[str, Any]) -> None:
-    filters = config.setdefault("filters", {})
-    filters.setdefault(
-        FILTER_NAME,
-        {"()": "care_logging.logging_config.BelowErrorFilter"},
+def _level_at_least_error(level: Any) -> bool:
+    if isinstance(level, int):
+        return level >= logging.ERROR
+    if not isinstance(level, str):
+        return False
+    name = level.upper()
+    if name in {"ERROR", "CRITICAL", "FATAL"}:
+        return True
+    numeric = getattr(logging, name, None)
+    return isinstance(numeric, int) and numeric >= logging.ERROR
+
+
+def _is_compatible_below_error_filter(cfg: Any) -> bool:
+    return isinstance(cfg, dict) and cfg.get("()") == _BELOW_ERROR_FILTER_FACTORY
+
+
+def _is_compatible_stderr_handler(cfg: Any, formatter: str) -> bool:
+    if not isinstance(cfg, dict) or not _is_stream_handler(cfg):
+        return False
+    if cfg.get("stream") != "ext://sys.stderr":
+        return False
+    if not _level_at_least_error(cfg.get("level", "ERROR")):
+        return False
+    existing_formatter = cfg.get("formatter")
+    return existing_formatter in (None, formatter)
+
+
+def _is_compatible_stdout_handler(cfg: Any, formatter: str, filter_name: str) -> bool:
+    if not isinstance(cfg, dict) or not _is_stream_handler(cfg):
+        return False
+    if cfg.get("stream") != "ext://sys.stdout":
+        return False
+    filters = list(cfg.get("filters") or [])
+    if filter_name not in filters:
+        return False
+    existing_formatter = cfg.get("formatter")
+    return existing_formatter in (None, formatter)
+
+
+def _claim_resource_name(
+    mapping: dict[str, Any],
+    preferred: str,
+    is_compatible: Callable[[Any], bool],
+    *,
+    kind: str,
+) -> str:
+    """Return *preferred*, replacing an incompatible pre-existing plug entry.
+
+    Care generic names (``below_error``, ``console_error``, …) are never used as
+    *preferred*, so they remain untouched. An incompatible entry already using a
+    plug-namespaced key cannot be left in place — ``dictConfig`` would fail — so
+    it is replaced after a warning.
+    """
+    existing = mapping.get(preferred)
+    if existing is None or is_compatible(existing):
+        return preferred
+    logger.warning(
+        "care_logging: replacing incompatible existing %s %r so logging can be configured",
+        kind,
+        preferred,
     )
+    del mapping[preferred]
+    return preferred
 
 
 def _append_filter(handler_cfg: dict[str, Any], filter_name: str) -> None:
@@ -85,24 +146,53 @@ def _append_filter(handler_cfg: dict[str, Any], filter_name: str) -> None:
     handler_cfg["filters"] = filters
 
 
-def _ensure_stderr_handler(config: dict[str, Any], formatter: str) -> None:
+def _resolve_plug_names(config: dict[str, Any], formatter: str) -> tuple[str, str, str]:
+    """Return (filter_name, stdout_handler_name, stderr_handler_name) for this config."""
+    filters = config.setdefault("filters", {})
     handlers = config.setdefault("handlers", {})
-    handlers.setdefault(
+
+    filter_name = _claim_resource_name(
+        filters,
+        FILTER_NAME,
+        _is_compatible_below_error_filter,
+        kind="filter",
+    )
+    stderr_name = _claim_resource_name(
+        handlers,
         STDERR_HANDLER_NAME,
-        {
+        lambda cfg: _is_compatible_stderr_handler(cfg, formatter),
+        kind="handler",
+    )
+    stdout_name = _claim_resource_name(
+        handlers,
+        STDOUT_HANDLER_NAME,
+        lambda cfg: _is_compatible_stdout_handler(cfg, formatter, filter_name),
+        kind="handler",
+    )
+    return filter_name, stdout_name, stderr_name
+
+
+def _configure_handlers(
+    config: dict[str, Any],
+    *,
+    filter_name: str,
+    stdout_name: str,
+    stderr_name: str,
+    formatter: str,
+) -> None:
+    handlers = config.setdefault("handlers", {})
+    filters = config.setdefault("filters", {})
+
+    if not _is_compatible_below_error_filter(filters.get(filter_name)):
+        filters[filter_name] = {"()": _BELOW_ERROR_FILTER_FACTORY}
+
+    if not _is_compatible_stderr_handler(handlers.get(stderr_name), formatter):
+        handlers[stderr_name] = {
             "level": "ERROR",
             "class": "logging.StreamHandler",
             "stream": "ext://sys.stderr",
             "formatter": formatter,
-        },
-    )
-
-
-def _configure_handlers(config: dict[str, Any]) -> None:
-    handlers = config.setdefault("handlers", {})
-    formatter = _formatter_name(handlers)
-    _ensure_formatter(config, formatter)
-    _ensure_stderr_handler(config, formatter)
+        }
 
     console = handlers.get("console")
     if console is None:
@@ -115,50 +205,48 @@ def _configure_handlers(config: dict[str, Any]) -> None:
 
     if _is_stream_handler(console):
         console["stream"] = "ext://sys.stdout"
-        _append_filter(console, FILTER_NAME)
+        _append_filter(console, filter_name)
     else:
         # Non-stream console (file/JSON/etc.): leave it alone and add a dedicated stdout sink.
-        handlers.setdefault(
-            STDOUT_HANDLER_NAME,
-            {
+        if not _is_compatible_stdout_handler(handlers.get(stdout_name), formatter, filter_name):
+            handlers[stdout_name] = {
                 "level": console.get("level", "DEBUG"),
                 "class": "logging.StreamHandler",
                 "stream": "ext://sys.stdout",
                 "formatter": formatter,
-                "filters": [FILTER_NAME],
-            },
-        )
+                "filters": [filter_name],
+            }
 
     time_logging = handlers.get("time_logging")
     if isinstance(time_logging, dict) and _is_stream_handler(time_logging):
         time_logging["stream"] = "ext://sys.stdout"
-        _append_filter(time_logging, FILTER_NAME)
+        _append_filter(time_logging, filter_name)
 
 
-def _stdout_handler_name(config: dict[str, Any]) -> str:
+def _stdout_handler_name(config: dict[str, Any], allocated_stdout: str) -> str:
     handlers = config.get("handlers") or {}
     console = handlers.get("console")
     if isinstance(console, dict) and _is_stream_handler(console):
         return "console"
-    if STDOUT_HANDLER_NAME in handlers:
-        return STDOUT_HANDLER_NAME
+    if allocated_stdout in handlers:
+        return allocated_stdout
     return "console"
 
 
-def _configure_root(config: dict[str, Any]) -> None:
+def _configure_root(config: dict[str, Any], *, stdout_name: str, stderr_name: str) -> None:
     root = config.setdefault("root", {"level": "INFO", "handlers": ["console"]})
     root_handlers = list(root.get("handlers") or [])
-    stdout_handler = _stdout_handler_name(config)
+    stdout_handler = _stdout_handler_name(config, stdout_name)
 
     if stdout_handler not in root_handlers:
         root_handlers.insert(0, stdout_handler)
-    if STDERR_HANDLER_NAME not in root_handlers:
-        root_handlers.append(STDERR_HANDLER_NAME)
+    if stderr_name not in root_handlers:
+        root_handlers.append(stderr_name)
 
     root["handlers"] = root_handlers
 
 
-def _reroute_error_loggers(config: dict[str, Any]) -> None:
+def _reroute_error_loggers(config: dict[str, Any], *, stderr_name: str) -> None:
     """Point ERROR loggers that use ``console`` at the stderr handler.
 
     Propagation is only changed when ``console`` was replaced and leaving
@@ -176,7 +264,7 @@ def _reroute_error_loggers(config: dict[str, Any]) -> None:
         if "console" not in handlers:
             continue
 
-        new_handlers = [STDERR_HANDLER_NAME if handler == "console" else handler for handler in handlers]
+        new_handlers = [stderr_name if handler == "console" else handler for handler in handlers]
         logger_cfg["handlers"] = new_handlers
 
         # Default propagate is True when omitted.
@@ -184,7 +272,7 @@ def _reroute_error_loggers(config: dict[str, Any]) -> None:
             logger_cfg["propagate"] = False
 
 
-def _ensure_time_logging_errors_reach_stderr(config: dict[str, Any]) -> None:
+def _ensure_time_logging_errors_reach_stderr(config: dict[str, Any], *, stderr_name: str) -> None:
     """Keep time_logging INFO on stdout; route ERROR+ from that logger to stderr.
 
     Care's ``time_logging_middleware`` logger uses ``propagate=False`` with only
@@ -199,8 +287,8 @@ def _ensure_time_logging_errors_reach_stderr(config: dict[str, Any]) -> None:
     if not isinstance(time_logger, dict):
         return
     handler_names = list(time_logger.get("handlers") or [])
-    if STDERR_HANDLER_NAME not in handler_names:
-        handler_names.append(STDERR_HANDLER_NAME)
+    if stderr_name not in handler_names:
+        handler_names.append(stderr_name)
     time_logger["handlers"] = handler_names
 
 
@@ -244,11 +332,21 @@ def build_split_logging_config(base: dict[str, Any] | None = None) -> dict[str, 
     if "disable_existing_loggers" not in config:
         config["disable_existing_loggers"] = False
 
-    _ensure_below_error_filter(config)
-    _configure_handlers(config)
-    _configure_root(config)
-    _reroute_error_loggers(config)
-    _ensure_time_logging_errors_reach_stderr(config)
+    handlers = config.setdefault("handlers", {})
+    formatter = _formatter_name(handlers)
+    _ensure_formatter(config, formatter)
+    filter_name, stdout_name, stderr_name = _resolve_plug_names(config, formatter)
+
+    _configure_handlers(
+        config,
+        filter_name=filter_name,
+        stdout_name=stdout_name,
+        stderr_name=stderr_name,
+        formatter=formatter,
+    )
+    _configure_root(config, stdout_name=stdout_name, stderr_name=stderr_name)
+    _reroute_error_loggers(config, stderr_name=stderr_name)
+    _ensure_time_logging_errors_reach_stderr(config, stderr_name=stderr_name)
     return config
 
 
@@ -345,20 +443,58 @@ def apply_split_console_logging(*, force: bool = False) -> bool:
             return False
 
 
+def _existing_stream_formatter(
+    handlers: list[logging.Handler],
+) -> logging.Formatter | None:
+    """Return the formatter from an existing stream handler, if any.
+
+    Preserves Celery's ``TaskFormatter`` so ``%(task_name)s`` / ``%(task_id)s``
+    keep working after the stream split.
+    """
+    for handler in handlers:
+        if isinstance(handler, logging.StreamHandler) and handler.formatter is not None:
+            return handler.formatter
+    return None
+
+
 def _make_stream_handler(
     stream: Any,
     *,
     level: int,
-    fmt: str | None,
+    formatter: logging.Formatter | None = None,
+    fmt: str | None = None,
     filters: list[logging.Filter] | None = None,
 ) -> logging.StreamHandler:
     handler = logging.StreamHandler(stream)
     handler.setLevel(level)
-    if fmt:
+    if formatter is not None:
+        handler.setFormatter(formatter)
+    elif fmt:
         handler.setFormatter(logging.Formatter(fmt))
     for filt in filters or []:
         handler.addFilter(filt)
     return handler
+
+
+def _reenable_celery_loggers() -> None:
+    """Clear ``disabled`` on Celery loggers left behind by ``disable_existing_loggers``.
+
+    Care deployment sets ``disable_existing_loggers=True``. If Celery loggers
+    existed before Django's ``dictConfig``, they remain ``disabled=True`` even
+    after Celery reinstalls handlers.
+    """
+    manager = logging.Logger.manager
+    for name, candidate in list(manager.loggerDict.items()):
+        if not any(name == prefix or name.startswith(f"{prefix}.") for prefix in _CELERY_LOGGER_PREFIXES):
+            continue
+        if isinstance(candidate, logging.PlaceHolder):
+            continue
+        if isinstance(candidate, logging.Logger):
+            candidate.disabled = False
+    for prefix in _CELERY_LOGGER_PREFIXES:
+        logging.getLogger(prefix).disabled = False
+        # Ensure the task logger used by Celery is enabled even if not yet created.
+        logging.getLogger(f"{prefix}.task").disabled = False
 
 
 def apply_celery_stream_split(
@@ -383,6 +519,7 @@ def apply_celery_stream_split(
         prior_handlers = list(target.handlers)
         try:
             if _is_split_active_on_logger(target):
+                target.disabled = False
                 return False
 
             level = loglevel if loglevel is not None else target.level or logging.INFO
@@ -392,19 +529,22 @@ def apply_celery_stream_split(
                 level = logging.INFO
 
             # Build replacements first so a construction failure leaves the
-            # logger untouched.
+            # logger untouched. Reuse Celery's formatter instance (TaskFormatter).
             preserved = [h for h in prior_handlers if not isinstance(h, logging.StreamHandler)]
             to_replace = [h for h in prior_handlers if isinstance(h, logging.StreamHandler)]
+            existing_formatter = _existing_stream_formatter(to_replace)
             stdout_handler = _make_stream_handler(
                 sys.stdout,
                 level=level,
-                fmt=fmt,
+                formatter=existing_formatter,
+                fmt=None if existing_formatter is not None else fmt,
                 filters=[BelowErrorFilter()],
             )
             stderr_handler = _make_stream_handler(
                 sys.stderr,
                 level=max(level, logging.ERROR),
-                fmt=fmt,
+                formatter=existing_formatter,
+                fmt=None if existing_formatter is not None else fmt,
             )
 
             target.handlers = []
@@ -414,6 +554,7 @@ def apply_celery_stream_split(
             target.addHandler(stderr_handler)
             if level:
                 target.setLevel(level)
+            target.disabled = False
             setattr(target, _LOGGER_SPLIT_MARKER, True)
 
             for handler in to_replace:
@@ -441,6 +582,7 @@ def _on_after_setup_logger(
     **_kwargs,
 ) -> None:
     apply_celery_stream_split(logger, loglevel=loglevel, fmt=format, logfile=logfile)
+    _reenable_celery_loggers()
 
     # Celery clears handlers on the ``celery`` logger during hijack. If Care's
     # LOGGING left it at propagate=False, records would be dropped — restore
@@ -448,6 +590,7 @@ def _on_after_setup_logger(
     celery_logger = logging.getLogger("celery")
     if not celery_logger.handlers and not celery_logger.propagate:
         celery_logger.propagate = True
+    celery_logger.disabled = False
 
 
 def _on_after_setup_task_logger(
@@ -459,8 +602,12 @@ def _on_after_setup_task_logger(
     **_kwargs,
 ) -> None:
     # Task logger defaults to propagate=False; keep that and split its own handlers
-    # so task records are not duplicated via root.
+    # so task records are not duplicated via root. Preserve TaskFormatter via the
+    # existing handler's formatter instance.
     apply_celery_stream_split(logger, loglevel=loglevel, fmt=format, logfile=logfile)
+    _reenable_celery_loggers()
+    if logger is not None:
+        logger.disabled = False
 
 
 def install_celery_logging_hooks() -> bool:
@@ -505,3 +652,4 @@ def reset_apply_state() -> None:
             log = logging.getLogger(name)
             if hasattr(log, _LOGGER_SPLIT_MARKER):
                 delattr(log, _LOGGER_SPLIT_MARKER)
+            log.disabled = False

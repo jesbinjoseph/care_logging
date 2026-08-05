@@ -68,6 +68,7 @@ def isolated_logging():
             log.addHandler(handler)
         log.setLevel(level)
         log.propagate = propagate
+        log.disabled = False
 
 
 def test_below_error_filter():
@@ -189,20 +190,55 @@ def test_preserves_existing_custom_filters_and_non_console_handlers():
     assert STDERR_HANDLER_NAME in config["root"]["handlers"]
 
 
-def test_does_not_overwrite_existing_plug_or_generic_names():
+def test_does_not_overwrite_existing_plug_or_generic_names(isolated_logging):
     base = copy.deepcopy(CARE_BASE_LOGGING)
     base["filters"] = {
         "below_error": {"marker": "care-original"},
         FILTER_NAME: {"marker": "preexisting-plug-filter"},
     }
-    base["handlers"]["console_error"] = {"marker": "care-original-handler"}
+    base["handlers"]["console_error"] = {
+        "level": "ERROR",
+        "class": "logging.StreamHandler",
+        "stream": "ext://sys.stderr",
+        "formatter": "verbose",
+    }
     base["handlers"][STDERR_HANDLER_NAME] = {"marker": "preexisting-plug-handler"}
     config = build_split_logging_config(base)
 
+    # Care generic names are preserved.
     assert config["filters"]["below_error"] == {"marker": "care-original"}
-    assert config["filters"][FILTER_NAME] == {"marker": "preexisting-plug-filter"}
-    assert config["handlers"]["console_error"] == {"marker": "care-original-handler"}
-    assert config["handlers"][STDERR_HANDLER_NAME] == {"marker": "preexisting-plug-handler"}
+    assert config["handlers"]["console_error"]["stream"] == "ext://sys.stderr"
+
+    # Incompatible plug-namespaced entries are replaced with usable definitions.
+    assert config["filters"][FILTER_NAME]["()"] == (
+        "care_logging.logging_config.BelowErrorFilter"
+    )
+    assert config["handlers"][STDERR_HANDLER_NAME]["stream"] == "ext://sys.stderr"
+    assert config["handlers"][STDERR_HANDLER_NAME]["level"] == "ERROR"
+    assert FILTER_NAME in config["handlers"]["console"]["filters"]
+    assert STDERR_HANDLER_NAME in config["root"]["handlers"]
+
+    # Resulting configuration must be usable with dictConfig.
+    logging.config.dictConfig(config)
+
+
+def test_reuses_compatible_existing_plug_resources():
+    base = copy.deepcopy(CARE_BASE_LOGGING)
+    base["filters"] = {
+        FILTER_NAME: {"()": "care_logging.logging_config.BelowErrorFilter"},
+    }
+    base["handlers"][STDERR_HANDLER_NAME] = {
+        "level": "ERROR",
+        "class": "logging.StreamHandler",
+        "stream": "ext://sys.stderr",
+        "formatter": "verbose",
+    }
+    config = build_split_logging_config(base)
+    assert config["filters"][FILTER_NAME]["()"] == (
+        "care_logging.logging_config.BelowErrorFilter"
+    )
+    assert config["handlers"][STDERR_HANDLER_NAME]["formatter"] == "verbose"
+    assert list(config["handlers"]).count(STDERR_HANDLER_NAME) == 1
 
 
 def test_build_is_idempotent():
@@ -399,6 +435,7 @@ def test_django_appconfig_ready_applies_split(monkeypatch, isolated_logging):
 
 def test_celery_stream_split_after_hijack(monkeypatch, isolated_logging):
     pytest.importorskip("celery")
+    from celery.app.log import TaskFormatter
     from celery.signals import after_setup_logger, after_setup_task_logger
 
     stdout = io.StringIO()
@@ -406,22 +443,35 @@ def test_celery_stream_split_after_hijack(monkeypatch, isolated_logging):
     monkeypatch.setattr(sys, "stdout", stdout)
     monkeypatch.setattr(sys, "stderr", stderr)
 
-    # Simulate Django apply first.
-    logging.config.dictConfig(build_split_logging_config(copy.deepcopy(CARE_BASE_LOGGING)))
+    worker_log_format = "[%(asctime)s: %(levelname)s/%(processName)s] %(message)s"
+    worker_task_log_format = (
+        "[%(asctime)s: %(levelname)s/%(processName)s] %(task_name)s[%(task_id)s]: %(message)s"
+    )
+
+    # Simulate Django apply with Care *deployment* logging
+    # (disable_existing_loggers=True disables pre-existing Celery loggers).
+    celery_logger = logging.getLogger("celery")
+    task_logger = logging.getLogger("celery.task")
+    celery_logger.disabled = False
+    task_logger.disabled = False
+    # Touch the loggers so they exist before dictConfig disables them.
+    _ = celery_logger.name, task_logger.name
+
+    logging.config.dictConfig(build_split_logging_config(copy.deepcopy(CARE_DEPLOYMENT_LOGGING)))
+    assert celery_logger.disabled is True
+    assert task_logger.disabled is True
     assert apply_split_console_logging() is False
 
     # Celery hijack: clear root / celery handlers and install a stderr handler.
     root = logging.getLogger()
     root.handlers = []
-    celery_logger = logging.getLogger("celery")
     celery_logger.handlers = []
-    celery_logger.propagate = False  # as left by Care test LOGGING + our reroute
-    task_logger = logging.getLogger("celery.task")
+    celery_logger.propagate = False
     task_logger.handlers = []
 
     hijack = logging.StreamHandler(sys.stderr)
     hijack.setLevel(logging.INFO)
-    hijack.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    hijack.setFormatter(logging.Formatter(worker_log_format))
     root.addHandler(hijack)
 
     assert install_celery_logging_hooks() is True
@@ -431,28 +481,32 @@ def test_celery_stream_split_after_hijack(monkeypatch, isolated_logging):
         logger=root,
         loglevel=logging.INFO,
         logfile=None,
-        format="%(levelname)s %(message)s",
+        format=worker_log_format,
         colorize=False,
     )
     task_logger.propagate = False
     task_handler = logging.StreamHandler(sys.stderr)
     task_handler.setLevel(logging.INFO)
+    task_handler.setFormatter(TaskFormatter(worker_task_log_format, use_color=False))
     task_logger.addHandler(task_handler)
     after_setup_task_logger.send(
         sender=None,
         logger=task_logger,
         loglevel=logging.INFO,
         logfile=None,
-        format="%(levelname)s %(message)s",
+        format=worker_task_log_format,
         colorize=False,
     )
 
-    # Hijack cleared celery handlers; hook should restore propagate.
+    # Hijack cleared celery handlers; hook should restore propagate and re-enable.
     assert celery_logger.propagate is True
+    assert celery_logger.disabled is False
+    assert task_logger.disabled is False
 
     root.info("celery-root-info")
     root.warning("celery-root-warning")
     root.error("celery-root-error")
+    # TaskFormatter injects task_name/task_id; must not raise ValueError.
     task_logger.info("celery-task-info")
     task_logger.error("celery-task-error")
 
@@ -465,10 +519,16 @@ def test_celery_stream_split_after_hijack(monkeypatch, isolated_logging):
     assert out.count("celery-root-info") == 1
     assert err.count("celery-root-error") == 1
     assert "celery-task-info" in out
+    assert "???" in out  # TaskFormatter default when no active task
     assert err.count("celery-task-error") == 1
     assert "celery-task-info" not in err
     # Task logger must not duplicate via root.
     assert out.count("celery-task-info") == 1
+
+    # Preserved TaskFormatter on both split handlers.
+    task_formatters = [h.formatter for h in task_logger.handlers if isinstance(h, logging.StreamHandler)]
+    assert task_formatters
+    assert all(isinstance(fmt, TaskFormatter) for fmt in task_formatters)
 
     # Idempotent: sending the signal again must not duplicate handlers.
     after_setup_logger.send(
@@ -476,10 +536,12 @@ def test_celery_stream_split_after_hijack(monkeypatch, isolated_logging):
         logger=root,
         loglevel=logging.INFO,
         logfile=None,
-        format="%(levelname)s %(message)s",
+        format=worker_log_format,
         colorize=False,
     )
     assert sum(1 for h in root.handlers if isinstance(h, logging.StreamHandler)) == 2
+    assert celery_logger.disabled is False
+    assert task_logger.disabled is False
 
 
 def test_celery_stream_split_skips_logfile(isolated_logging):
