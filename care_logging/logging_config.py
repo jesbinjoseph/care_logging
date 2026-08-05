@@ -186,8 +186,8 @@ def build_split_logging_config(base: dict[str, Any] | None = None) -> dict[str, 
         }
 
     config["version"] = config.get("version", 1)
-    # Never disable existing loggers — preserve Care / third-party loggers.
-    config["disable_existing_loggers"] = False
+    # Preserve Care's choice (base/test=False, deployment=True).
+    config.setdefault("disable_existing_loggers", False)
 
     _ensure_below_error_filter(config)
     _configure_handlers(config)

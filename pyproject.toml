@@ -32,6 +32,9 @@ include = ["care_logging", "care_logging.*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+  "integration: checks against latest ohcnetwork/care LOGGING (needs network)",
+]
 
 [tool.ruff]
 line-length = 120

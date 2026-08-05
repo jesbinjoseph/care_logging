@@ -89,7 +89,7 @@ def test_build_split_logging_config_matches_pr_intent():
     config = build_split_logging_config(_care_like_base())
 
     assert "below_error" in config["filters"]
-    assert config["disable_existing_loggers"] is False
+    assert config["disable_existing_loggers"] is False  # preserved from fixture
     assert config["handlers"]["console"]["stream"] == "ext://sys.stdout"
     assert "below_error" in config["handlers"]["console"]["filters"]
     assert config["handlers"]["console_error"]["stream"] == "ext://sys.stderr"

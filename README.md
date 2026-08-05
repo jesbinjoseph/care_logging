@@ -60,5 +60,12 @@ Register a local `Plug` the same way as other Care plugs (editable install path)
 ## Tests
 
 ```bash
-make test
+make test-unit   # local unit tests
+make test-care   # fetch latest ohcnetwork/care@develop LOGGING and verify the plug
+make test        # both
 ```
+
+`make test-care` is the practical success check against Care: it loads Care's real
+`LOGGING` dicts from `base.py` / `deployment.py` / `test.py`, applies the plug, and
+asserts INFO→stdout / ERROR→stderr. A full Care install is unnecessary for this
+plug and mostly tests Care's own dependencies rather than logging behavior.
