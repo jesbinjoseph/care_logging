@@ -4,9 +4,6 @@ Full Care install is not required to validate this plug: Care's logging behavior
 is defined by the LOGGING dict in settings. These tests fetch the latest
 ``develop`` settings modules from GitHub, extract ``LOGGING``, apply the plug
 transform, and verify stdout/stderr routing.
-
-That is a valid success check for this plug. A full Care boot would mainly prove
-dependency/install wiring, which is much heavier and mostly orthogonal.
 """
 
 from __future__ import annotations
@@ -23,6 +20,8 @@ from typing import Any
 import pytest
 
 from care_logging.logging_config import (
+    FILTER_NAME,
+    STDERR_HANDLER_NAME,
     apply_split_console_logging,
     build_split_logging_config,
     reset_apply_state,
@@ -89,15 +88,16 @@ def test_latest_care_logging_transform_succeeds(
     config = build_split_logging_config(base)
 
     assert config["disable_existing_loggers"] is original_disable
-    assert "below_error" in config["filters"]
+    assert FILTER_NAME in config["filters"]
     assert config["handlers"]["console"]["stream"] == "ext://sys.stdout"
-    assert "below_error" in config["handlers"]["console"]["filters"]
-    assert config["handlers"]["console_error"]["stream"] == "ext://sys.stderr"
-    assert "console_error" in config["root"]["handlers"]
+    assert FILTER_NAME in config["handlers"]["console"]["filters"]
+    assert config["handlers"][STDERR_HANDLER_NAME]["stream"] == "ext://sys.stderr"
+    assert STDERR_HANDLER_NAME in config["root"]["handlers"]
 
     if "time_logging" in base.get("handlers", {}):
         assert config["handlers"]["time_logging"]["stream"] == "ext://sys.stdout"
-        assert "below_error" in config["handlers"]["time_logging"]["filters"]
+        assert FILTER_NAME in config["handlers"]["time_logging"]["filters"]
+        assert STDERR_HANDLER_NAME in config["loggers"]["time_logging_middleware"]["handlers"]
 
     for name, logger_cfg in base.get("loggers", {}).items():
         if str(logger_cfg.get("level", "")).upper() != "ERROR":
@@ -105,8 +105,7 @@ def test_latest_care_logging_transform_succeeds(
         if "console" not in list(logger_cfg.get("handlers") or []):
             continue
         assert config["loggers"][name]["handlers"] == [
-            "console_error" if h == "console" else h
-            for h in logger_cfg.get("handlers") or []
+            STDERR_HANDLER_NAME if h == "console" else h for h in logger_cfg.get("handlers") or []
         ]
         assert config["loggers"][name]["propagate"] is False
 
@@ -164,15 +163,13 @@ def test_django_loads_plug_against_care_base_logging(
     )
     django.setup()
 
-    # ready() should have applied the split already.
     root = logging.getLogger()
     root.info("django-ready-info")
     root.error("django-ready-error")
 
     assert "django-ready-info" in stdout.getvalue()
     assert "django-ready-error" in stderr.getvalue()
-    assert apply_split_console_logging() is False  # idempotent after ready()
+    assert apply_split_console_logging() is False
 
 
-# Minimal urlpatterns so ROOT_URLCONF import succeeds if Django resolves it.
 urlpatterns: list = []

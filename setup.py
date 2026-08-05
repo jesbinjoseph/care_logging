@@ -26,6 +26,10 @@ setup(
     install_requires=[
         "django",
     ],
+    extras_require={
+        "celery": ["celery>=5.3"],
+        "test": ["ruff>=0.6", "pytest>=8.0", "celery==5.6.0"],
+    },
     license="MIT license",
     long_description=readme,
     long_description_content_type="text/markdown",
