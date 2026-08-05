@@ -23,8 +23,8 @@ test = [
 ]
 
 [project.urls]
-homepage = "https://github.com/egovhealthcare/care_logging"
-bugs = "https://github.com/egovhealthcare/care_logging/issues"
+homepage = "https://github.com/jesbinjoseph/care_logging"
+bugs = "https://github.com/jesbinjoseph/care_logging/issues"
 
 [tool.setuptools.packages.find]
 include = ["care_logging", "care_logging.*"]

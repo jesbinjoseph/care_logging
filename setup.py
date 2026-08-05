@@ -33,7 +33,7 @@ setup(
     keywords="care_logging care plug logging",
     name="care_logging",
     packages=find_packages(include=["care_logging", "care_logging.*"]),
-    url="https://github.com/egovhealthcare/care_logging",
+    url="https://github.com/jesbinjoseph/care_logging",
     version="0.1.0",
     zip_safe=False,
 )

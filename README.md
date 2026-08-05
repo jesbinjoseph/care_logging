@@ -25,7 +25,7 @@ If the plug is not installed, Care's default logging is unchanged. Configuration
   {
     "name": "care_logging",
     "version": "@main",
-    "package_name": "git+https://github.com/egovhealthcare/care_logging.git",
+    "package_name": "git+https://github.com/jesbinjoseph/care_logging.git",
     "configs": {}
   }
 ]
@@ -39,7 +39,7 @@ from plugs.plug import Plug
 
 care_logging = Plug(
     name="care_logging",
-    package_name="git+https://github.com/egovhealthcare/care_logging.git",
+    package_name="git+https://github.com/jesbinjoseph/care_logging.git",
     version="@main",
     configs={},
 )
