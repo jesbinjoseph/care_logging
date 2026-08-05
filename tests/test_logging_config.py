@@ -52,6 +52,7 @@ def isolated_logging():
         "celery.task",
         "time_logging_middleware",
         "custom.error",
+        "custom.info",
         "care.app",
     ):
         log = logging.getLogger(name)
@@ -164,6 +165,61 @@ def test_error_logger_preserves_extra_handlers_and_order():
     config = build_split_logging_config(base)
     assert config["loggers"]["django.request"]["handlers"] == ["file", STDERR_HANDLER_NAME]
     assert config["loggers"]["django.request"]["propagate"] is False
+
+
+def test_info_logger_with_console_and_no_propagate_keeps_errors():
+    base = copy.deepcopy(CARE_BASE_LOGGING)
+    base["loggers"]["custom.info"] = {
+        "handlers": ["console"],
+        "level": "INFO",
+        "propagate": False,
+    }
+    config = build_split_logging_config(base)
+
+    assert config["loggers"]["custom.info"]["handlers"] == ["console", STDERR_HANDLER_NAME]
+    assert config["loggers"]["custom.info"]["propagate"] is False
+    assert config["loggers"]["custom.info"]["level"] == "INFO"
+
+
+def test_info_logger_with_console_that_propagates_is_unchanged():
+    base = copy.deepcopy(CARE_BASE_LOGGING)
+    base["loggers"]["custom.info"] = {
+        "handlers": ["console"],
+        "level": "INFO",
+        # propagate defaults to True — ERROR+ reaches root's stderr handler.
+    }
+    original = copy.deepcopy(base["loggers"]["custom.info"])
+    config = build_split_logging_config(base)
+    assert config["loggers"]["custom.info"] == original
+
+
+def test_live_info_logger_without_propagate_routes_error_to_stderr(monkeypatch, isolated_logging):
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    base = copy.deepcopy(CARE_BASE_LOGGING)
+    base["loggers"]["custom.info"] = {
+        "handlers": ["console"],
+        "level": "INFO",
+        "propagate": False,
+    }
+    logging.config.dictConfig(build_split_logging_config(base))
+
+    log = logging.getLogger("custom.info")
+    log.info("custom-info-ok")
+    log.error("custom-info-error")
+    log.critical("custom-info-critical")
+
+    out = stdout.getvalue()
+    err = stderr.getvalue()
+    assert "custom-info-ok" in out
+    assert "custom-info-error" not in out
+    assert "custom-info-critical" not in out
+    assert err.count("custom-info-error") == 1
+    assert err.count("custom-info-critical") == 1
+    assert "custom-info-ok" not in err
 
 
 def test_preserves_existing_custom_filters_and_non_console_handlers():

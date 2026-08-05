@@ -246,50 +246,72 @@ def _configure_root(config: dict[str, Any], *, stdout_name: str, stderr_name: st
     root["handlers"] = root_handlers
 
 
-def _reroute_error_loggers(config: dict[str, Any], *, stderr_name: str) -> None:
-    """Point ERROR loggers that use ``console`` at the stderr handler.
+def _handler_has_named_filter(handler_cfg: Any, filter_name: str) -> bool:
+    return isinstance(handler_cfg, dict) and filter_name in list(handler_cfg.get("filters") or [])
 
-    Propagation is only changed when ``console`` was replaced and leaving
-    propagate enabled would duplicate records via root's stderr handler.
-    Loggers that do not use ``console`` are left untouched.
+
+def _level_is_error_or_above(level: str) -> bool:
+    return level in {"ERROR", "CRITICAL", "FATAL"}
+
+
+def _ensure_named_loggers_reach_stderr(
+    config: dict[str, Any],
+    *,
+    stderr_name: str,
+    filter_name: str,
+) -> None:
+    """Keep ERROR+ visible for named loggers after console is filtered below ERROR.
+
+    - ERROR/CRITICAL loggers that use ``console`` are pointed at the stderr
+      handler (console would emit nothing useful once filtered). Propagation is
+      only disabled when that replacement would otherwise duplicate via root.
+    - Any non-propagating logger whose handlers include a below-ERROR filter
+      (``console``, ``time_logging``, …) gets the stderr handler appended so
+      ERROR+ records are not silently dropped.
+    - Loggers that do not use a filtered console/stream handler are untouched.
     """
+    handlers_cfg = config.get("handlers") or {}
+    console = handlers_cfg.get("console")
+    console_is_filtered_stream = (
+        isinstance(console, dict)
+        and _is_stream_handler(console)
+        and _handler_has_named_filter(console, filter_name)
+    )
+
     loggers = config.setdefault("loggers", {})
     for _name, logger_cfg in list(loggers.items()):
         if not isinstance(logger_cfg, dict):
             continue
+        handler_names = list(logger_cfg.get("handlers") or [])
+        if not handler_names:
+            continue
+
         level = str(logger_cfg.get("level") or "").upper()
-        if level != "ERROR":
-            continue
-        handlers = list(logger_cfg.get("handlers") or [])
-        if "console" not in handlers:
+
+        # ERROR+ only loggers: replace filtered console with stderr.
+        if (
+            _level_is_error_or_above(level)
+            and "console" in handler_names
+            and console_is_filtered_stream
+        ):
+            logger_cfg["handlers"] = [
+                stderr_name if handler == "console" else handler for handler in handler_names
+            ]
+            if logger_cfg.get("propagate", True):
+                logger_cfg["propagate"] = False
             continue
 
-        new_handlers = [stderr_name if handler == "console" else handler for handler in handlers]
-        logger_cfg["handlers"] = new_handlers
-
-        # Default propagate is True when omitted.
+        # Non-propagating loggers with a below-ERROR filtered handler would
+        # otherwise drop ERROR+ (e.g. level=INFO, handlers=[console], propagate=False).
         if logger_cfg.get("propagate", True):
-            logger_cfg["propagate"] = False
-
-
-def _ensure_time_logging_errors_reach_stderr(config: dict[str, Any], *, stderr_name: str) -> None:
-    """Keep time_logging INFO on stdout; route ERROR+ from that logger to stderr.
-
-    Care's ``time_logging_middleware`` logger uses ``propagate=False`` with only
-    the ``time_logging`` handler. Filtering that handler below ERROR would
-    otherwise drop ERROR+ records entirely.
-    """
-    handlers = config.get("handlers") or {}
-    if "time_logging" not in handlers:
-        return
-    loggers = config.setdefault("loggers", {})
-    time_logger = loggers.get("time_logging_middleware")
-    if not isinstance(time_logger, dict):
-        return
-    handler_names = list(time_logger.get("handlers") or [])
-    if stderr_name not in handler_names:
-        handler_names.append(stderr_name)
-    time_logger["handlers"] = handler_names
+            continue
+        has_filtered_handler = any(
+            _handler_has_named_filter(handlers_cfg.get(handler), filter_name)
+            for handler in handler_names
+        )
+        if has_filtered_handler and stderr_name not in handler_names:
+            handler_names.append(stderr_name)
+            logger_cfg["handlers"] = handler_names
 
 
 def _get_settings_logging() -> dict[str, Any] | None:
@@ -345,8 +367,11 @@ def build_split_logging_config(base: dict[str, Any] | None = None) -> dict[str, 
         formatter=formatter,
     )
     _configure_root(config, stdout_name=stdout_name, stderr_name=stderr_name)
-    _reroute_error_loggers(config, stderr_name=stderr_name)
-    _ensure_time_logging_errors_reach_stderr(config, stderr_name=stderr_name)
+    _ensure_named_loggers_reach_stderr(
+        config,
+        stderr_name=stderr_name,
+        filter_name=filter_name,
+    )
     return config
 
 
