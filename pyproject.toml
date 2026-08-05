@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "care_logging"
+version = "0.1.0"
+description = "Care plug that routes ERROR+ logs to stderr and lower-severity logs to stdout"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Open Health Care Network", email = "support@ohc.network" },
+]
+dependencies = [
+  "django",
+]
+
+[project.optional-dependencies]
+test = [
+  "ruff>=0.6",
+  "pytest>=8.0",
+]
+
+[project.urls]
+homepage = "https://github.com/egovhealthcare/care_logging"
+bugs = "https://github.com/egovhealthcare/care_logging/issues"
+
+[tool.setuptools.packages.find]
+include = ["care_logging", "care_logging.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+  "E",
+  "W",
+  "F",
+  "I",
+  "B",
+  "UP",
+]
